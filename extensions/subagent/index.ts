@@ -48,6 +48,8 @@ interface SubagentResult {
 	label?: string;
 	resumed: boolean;
 	timeoutMs?: number;
+	startedAt: number;
+	endedAt?: number;
 	exitCode: number;
 	messages: Message[];
 	toolActivity: ToolActivity[];
@@ -510,6 +512,7 @@ async function runChild(
 		label,
 		resumed: Boolean(resumePath),
 		timeoutMs,
+		startedAt: Date.now(),
 		exitCode: -1,
 		messages: [],
 		toolActivity: [],
@@ -682,6 +685,7 @@ async function runChild(
 	}
 	if (timedOut) result.stopReason = "timeout";
 	else if (aborted) result.stopReason = "aborted";
+	result.endedAt = Date.now();
 	return result;
 }
 
@@ -720,6 +724,10 @@ function formatTimeout(timeoutMs: number | undefined): string {
 function timeoutBadge(timeoutMs: number | undefined): string {
 	const formatted = formatTimeout(timeoutMs);
 	return formatted ? `[⏱ ${formatted}]` : "";
+}
+
+function elapsedBadge(elapsedMs: number): string {
+	return `[⏱ ${formatTimeout(Math.max(0, elapsedMs))}]`;
 }
 
 function usageText(result: SubagentResult): string {
@@ -906,7 +914,7 @@ export default function (pi: ExtensionAPI) {
 				0,
 			);
 		},
-		renderResult(toolResult, { expanded }, theme) {
+		renderResult(toolResult, { expanded }, theme, context) {
 			const details = toolResult.details as SubagentDetails | undefined;
 			if (!details?.result) {
 				const content = toolResult.content[0];
@@ -923,11 +931,17 @@ export default function (pi: ExtensionAPI) {
 			const title = result.label ?? (result.resumed ? "resumed child" : "child");
 			const items = displayItems(result);
 
-			const timeout = timeoutBadge(result.timeoutMs);
+			if (status === "running") {
+				if (!context.state.elapsedInterval) context.state.elapsedInterval = setInterval(() => context.invalidate(), 1000);
+			} else if (context.state.elapsedInterval) {
+				clearInterval(context.state.elapsedInterval);
+				context.state.elapsedInterval = undefined;
+			}
+			const elapsed = elapsedBadge((status === "running" ? Date.now() : (result.endedAt ?? Date.now())) - result.startedAt);
 
 			if (!expanded) {
 				const recent = items.slice(-COLLAPSED_ITEM_COUNT);
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(title))}${timeout ? ` ${theme.fg("dim", timeout)}` : ""} ${theme.fg(success ? "success" : "warning", status)}`;
+				let text = `${icon} ${theme.fg("toolTitle", theme.bold(title))} ${theme.fg("dim", elapsed)} ${theme.fg(success ? "success" : "warning", status)}`;
 				if (items.length > recent.length) text += `\n${theme.fg("muted", `… ${items.length - recent.length} earlier items`)}`;
 				for (const item of recent) text += `\n${theme.fg(item.type === "toolResult" && item.isError ? "error" : "dim", compactItem(item))}`;
 				for (const activity of result.toolActivity.filter((item) => item.status === "running")) {
@@ -940,7 +954,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const container = new Container();
-			container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold(title))}${timeout ? ` ${theme.fg("dim", timeout)}` : ""} ${theme.fg(success ? "success" : "warning", status)}`, 0, 0));
+			container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold(title))} ${theme.fg("dim", elapsed)} ${theme.fg(success ? "success" : "warning", status)}`, 0, 0));
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("muted", "── Task ──"), 0, 0));
 			container.addChild(new Text(result.task, 0, 0));
