@@ -8,6 +8,7 @@ import { getSupportedThinkingLevels, StringEnum, type Message, type Model, type 
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
+	defineTool,
 	type ExtensionAPI,
 	getAgentDir,
 	getMarkdownTheme,
@@ -34,6 +35,9 @@ interface ChildMetadata {
 	model?: string;
 	thinking?: string;
 	tools: string[];
+	// The label given at creation, if any. Written once and never touched by later resumes, so a
+	// resume call without its own label can still show what this subagent was originally called.
+	label?: string;
 }
 
 interface ToolActivity {
@@ -43,7 +47,11 @@ interface ToolActivity {
 	status: "running" | "done" | "error";
 }
 
-interface SubagentResult {
+// Keyed by toolCallId. A running call's own SubagentResult object, mutated in place as the run
+// progresses -- absent once the call finishes, since its toolResult then carries the same data.
+export const activeSubagentCalls = new Map<string, SubagentResult>();
+
+export interface SubagentResult {
 	task: string;
 	label?: string;
 	resumed: boolean;
@@ -64,7 +72,7 @@ interface SubagentResult {
 	sessionId?: string;
 }
 
-interface SubagentDetails {
+export interface SubagentDetails {
 	result: SubagentResult;
 }
 
@@ -344,6 +352,7 @@ function readChildMetadata(sessionFile: string): ChildMetadata {
 		model: typeof value.model === "string" ? value.model : undefined,
 		thinking: typeof value.thinking === "string" ? value.thinking : undefined,
 		tools: value.tools.filter((tool): tool is string => typeof tool === "string"),
+		label: typeof value.label === "string" ? value.label : undefined,
 	};
 }
 
@@ -490,6 +499,7 @@ async function runChild(
 	signal: AbortSignal | undefined,
 	onUpdate: Update | undefined,
 	dependencies: RunChildDependencies = {},
+	toolCallId?: string,
 ): Promise<SubagentResult> {
 	const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 	const sessionDir = path.join(dependencies.agentDir ?? getAgentDir(), "sessions", "subagent", runId);
@@ -524,169 +534,181 @@ async function runChild(
 		sessionFile: resumePath,
 	};
 
-	const emitUpdate = () => {
-		onUpdate?.({
-			content: [{ type: "text", text: result.partialText || getFinalOutput(result) || "(running...)" }],
-			details: { result },
-		});
-	};
+	// Exposed so a viewer extension can inspect in-flight runs, which have no toolResult yet.
+	if (toolCallId) activeSubagentCalls.set(toolCallId, result);
 
-	let aborted = false;
-	let timedOut = false;
-	let currentTurnUsage: Usage | undefined;
-
-	const exitCode = await new Promise<number>((resolve) => {
-		const invocation = (dependencies.invoke ?? getPiInvocation)(args);
-		const proc = spawn(invocation.command, invocation.args, {
-			cwd: config.cwd,
-			shell: false,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-		let buffer = "";
-		const decoder = new StringDecoder("utf8");
-		let settled = false;
-		let timeout: ReturnType<typeof setTimeout> | undefined;
-
-		const finish = (code: number) => {
-			if (settled) return;
-			settled = true;
-			if (timeout) clearTimeout(timeout);
-			if (signal) signal.removeEventListener("abort", onAbort);
-			resolve(code);
+	try {
+		const emitUpdate = () => {
+			onUpdate?.({
+				content: [{ type: "text", text: result.partialText || getFinalOutput(result) || "(running...)" }],
+				details: { result },
+			});
 		};
-		const onAbort = () => {
-			if (timedOut) return;
-			aborted = true;
-			if (timeout) clearTimeout(timeout);
-			killChild(proc);
-		};
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			let event: any;
-			try {
-				event = JSON.parse(line);
-			} catch {
-				return;
-			}
 
-			if (event.type === "session" && event.id) {
-				result.sessionId = event.id;
-				if (!resumePath) resolveSessionFile(sessionDir, result);
-				emitUpdate();
-				return;
-			}
-			if (event.type === "message_start" && event.message?.role === "assistant") {
-				result.partialText = "";
-				currentTurnUsage = undefined;
-				result.usage.turns++;
-				return;
-			}
-			if (event.type === "message_update") {
-				if (event.usage) currentTurnUsage = event.usage as Usage;
-				const delta = event.assistantMessageEvent;
-				if (delta?.type === "text_delta" && typeof delta.delta === "string") {
-					result.partialText += delta.delta;
-					emitUpdate();
+		let aborted = false;
+		let timedOut = false;
+		let currentTurnUsage: Usage | undefined;
+
+		const exitCode = await new Promise<number>((resolve) => {
+			const invocation = (dependencies.invoke ?? getPiInvocation)(args);
+			const proc = spawn(invocation.command, invocation.args, {
+				cwd: config.cwd,
+				shell: false,
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			let buffer = "";
+			const decoder = new StringDecoder("utf8");
+			let settled = false;
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+
+			const finish = (code: number) => {
+				if (settled) return;
+				settled = true;
+				if (timeout) clearTimeout(timeout);
+				if (signal) signal.removeEventListener("abort", onAbort);
+				resolve(code);
+			};
+			const onAbort = () => {
+				if (timedOut) return;
+				aborted = true;
+				if (timeout) clearTimeout(timeout);
+				killChild(proc);
+			};
+			const processLine = (line: string) => {
+				if (!line.trim()) return;
+				let event: any;
+				try {
+					event = JSON.parse(line);
+				} catch {
+					return;
 				}
-				return;
-			}
-			if (event.type === "tool_execution_start") {
-				result.toolActivity.push({
-					id: String(event.toolCallId ?? ""),
-					name: String(event.toolName ?? "unknown"),
-					args: event.args && typeof event.args === "object" ? event.args : {},
-					status: "running",
-				});
-				emitUpdate();
-				return;
-			}
-			if (event.type === "tool_execution_end") {
-				const activity = result.toolActivity.find((item) => item.id === String(event.toolCallId ?? ""));
-				if (activity) activity.status = event.isError ? "error" : "done";
-				emitUpdate();
-				return;
-			}
-			if (event.type === "message_end" && event.message) {
-				const message = event.message as Message;
-				result.messages.push(message);
-				if (message.role === "assistant") {
+
+				if (event.type === "session" && event.id) {
+					result.sessionId = event.id;
+					if (!resumePath) resolveSessionFile(sessionDir, result);
+					emitUpdate();
+					return;
+				}
+				if (event.type === "message_start" && event.message?.role === "assistant") {
 					result.partialText = "";
 					currentTurnUsage = undefined;
-					if (message.usage) addUsage(result.usage, message.usage);
-					const reportedModel = message.model as string | undefined;
-					const provider = (message as any).provider as string | undefined;
-					if (reportedModel && !config.model) {
-						result.model = provider ? `${provider}/${reportedModel}` : reportedModel;
-						config.model = result.model;
-					}
-					if (message.stopReason) result.stopReason = message.stopReason;
-					if (message.errorMessage) result.errorMessage = message.errorMessage;
+					result.usage.turns++;
+					return;
 				}
-				emitUpdate();
-				return;
+				if (event.type === "message_update") {
+					if (event.usage) currentTurnUsage = event.usage as Usage;
+					const delta = event.assistantMessageEvent;
+					if (delta?.type === "text_delta" && typeof delta.delta === "string") {
+						result.partialText += delta.delta;
+						emitUpdate();
+					}
+					return;
+				}
+				if (event.type === "tool_execution_start") {
+					result.toolActivity.push({
+						id: String(event.toolCallId ?? ""),
+						name: String(event.toolName ?? "unknown"),
+						args: event.args && typeof event.args === "object" ? event.args : {},
+						status: "running",
+					});
+					emitUpdate();
+					return;
+				}
+				if (event.type === "tool_execution_end") {
+					const activity = result.toolActivity.find((item) => item.id === String(event.toolCallId ?? ""));
+					if (activity) activity.status = event.isError ? "error" : "done";
+					emitUpdate();
+					return;
+				}
+				if (event.type === "message_end" && event.message) {
+					const message = event.message as Message;
+					result.messages.push(message);
+					if (message.role === "assistant") {
+						result.partialText = "";
+						currentTurnUsage = undefined;
+						if (message.usage) addUsage(result.usage, message.usage);
+						const reportedModel = message.model as string | undefined;
+						const provider = (message as any).provider as string | undefined;
+						if (reportedModel && !config.model) {
+							result.model = provider ? `${provider}/${reportedModel}` : reportedModel;
+							config.model = result.model;
+						}
+						if (message.stopReason) result.stopReason = message.stopReason;
+						if (message.errorMessage) result.errorMessage = message.errorMessage;
+					}
+					emitUpdate();
+					return;
+				}
+			};
+
+			proc.stdin?.on("error", () => {});
+			proc.stdin?.end(task);
+			proc.stdout?.on("data", (data) => {
+				buffer += decoder.write(data);
+				const lines = buffer.split("\n");
+				buffer = lines.pop() ?? "";
+				for (const line of lines) processLine(line);
+			});
+			proc.stderr?.on("data", (data) => {
+				result.stderr += data.toString();
+			});
+			proc.on("close", (code) => {
+				buffer += decoder.end();
+				if (buffer.trim()) processLine(buffer);
+				finish(code ?? 0);
+			});
+			proc.on("error", (error) => {
+				result.errorMessage = error.message;
+				finish(1);
+			});
+
+			if (timeoutMs) {
+				timeout = setTimeout(() => {
+					if (aborted) return;
+					timedOut = true;
+					killChild(proc);
+				}, timeoutMs);
 			}
-		};
-
-		proc.stdin?.on("error", () => {});
-		proc.stdin?.end(task);
-		proc.stdout?.on("data", (data) => {
-			buffer += decoder.write(data);
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-			for (const line of lines) processLine(line);
-		});
-		proc.stderr?.on("data", (data) => {
-			result.stderr += data.toString();
-		});
-		proc.on("close", (code) => {
-			buffer += decoder.end();
-			if (buffer.trim()) processLine(buffer);
-			finish(code ?? 0);
-		});
-		proc.on("error", (error) => {
-			result.errorMessage = error.message;
-			finish(1);
+			if (signal) {
+				if (signal.aborted) onAbort();
+				else signal.addEventListener("abort", onAbort, { once: true });
+			}
 		});
 
-		if (timeoutMs) {
-			timeout = setTimeout(() => {
-				if (aborted) return;
-				timedOut = true;
-				killChild(proc);
-			}, timeoutMs);
-		}
-		if (signal) {
-			if (signal.aborted) onAbort();
-			else signal.addEventListener("abort", onAbort, { once: true });
-		}
-	});
-
-	result.exitCode = exitCode;
-	if (currentTurnUsage) addUsage(result.usage, currentTurnUsage);
-	if (!resumePath) {
-		resolveSessionFile(sessionDir, result);
-		if (!result.sessionFile) {
+		result.exitCode = exitCode;
+		if (currentTurnUsage) addUsage(result.usage, currentTurnUsage);
+		if (!resumePath) resolveSessionFile(sessionDir, result);
+		if (!resumePath && !result.sessionFile) {
 			result.errorMessage = "Child session was not created; this run cannot be resumed.";
 			if (!timedOut && !aborted) result.exitCode = 1;
 		} else {
 			try {
-				writeChildMetadata(result.sessionFile, {
+				writeChildMetadata(result.sessionFile!, {
 					version: 2,
 					cwd: config.cwd,
 					model: config.model,
 					thinking: config.thinking,
 					tools: config.tools,
+					label,
 				});
 			} catch (error) {
-				result.errorMessage = `Child finished, but resume metadata could not be saved: ${error instanceof Error ? error.message : String(error)}`;
-				if (!timedOut && !aborted) result.exitCode = 1;
+				// A fresh child's metadata is load-bearing: it is the only record of cwd/model/
+				// thinking/tools, so a failed write means the session can never be resumed. On a
+				// resume, the metadata already existed and was already validated; a failed rewrite
+				// here just means the label doesn't stick for the next resume.
+				if (!resumePath) {
+					result.errorMessage = `Child finished, but resume metadata could not be saved: ${error instanceof Error ? error.message : String(error)}`;
+					if (!timedOut && !aborted) result.exitCode = 1;
+				}
 			}
 		}
+		if (timedOut) result.stopReason = "timeout";
+		else if (aborted) result.stopReason = "aborted";
+		result.endedAt = Date.now();
+		return result;
+	} finally {
+		if (toolCallId) activeSubagentCalls.delete(toolCallId);
 	}
-	if (timedOut) result.stopReason = "timeout";
-	else if (aborted) result.stopReason = "aborted";
-	result.endedAt = Date.now();
-	return result;
 }
 
 function formatTokens(count: number): string {
@@ -819,33 +841,35 @@ export const __testing = {
 	timeoutBadge,
 };
 
-export default function (pi: ExtensionAPI) {
-	pi.registerTool({
-		name: "subagent_models",
-		label: "Subagent Models",
-		description: "Return the model ids and model-supported thinking levels accepted by subagent under the configured child-model policy, with the default and optional benchmark notes. No child is started.",
-		promptSnippet: "List model and thinking values accepted by subagent",
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const { policy, error } = loadModelPolicy();
-			if (error) throw new Error(error);
-			const validationErrors = validateModelPolicy(policy, ctx.modelRegistry);
-			const catalog = compactModelCatalog(policy, validationErrors, ctx.modelRegistry);
-			return {
-				content: [{ type: "text", text: JSON.stringify(catalog) }],
-				details: catalog,
-			};
-		},
-	});
+export const subagentModelsToolDefinition = defineTool({
+	name: "subagent_models",
+	label: "Subagent Models",
+	description: "Return the model ids and model-supported thinking levels accepted by subagent under the configured child-model policy, with the default and optional benchmark notes. No child is started.",
+	promptSnippet: "List model and thinking values accepted by subagent",
+	parameters: Type.Object({}),
+	async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+		const { policy, error } = loadModelPolicy();
+		if (error) throw new Error(error);
+		const validationErrors = validateModelPolicy(policy, ctx.modelRegistry);
+		const catalog = compactModelCatalog(policy, validationErrors, ctx.modelRegistry);
+		return {
+			content: [{ type: "text", text: JSON.stringify(catalog) }],
+			details: catalog,
+		};
+	},
+});
 
-	pi.registerTool({
+// `execute` needs the registering extension's own ExtensionAPI to read the parent's active tools
+// (ExtensionContext has no equivalent), so this tool definition is a factory rather than a plain value.
+export function createSubagentToolDefinition(pi: ExtensionAPI) {
+	return defineTool({
 		name: "subagent",
 		label: "Subagent",
 		description: "Run one task in a separate Pi session and return its final or partial response with a session path that can be resumed.",
 		promptSnippet: "Run a task in a separate resumable Pi session",
 		promptGuidelines: SUBAGENT_GUIDELINES,
 		parameters: SubagentParams,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			if (!params.task.trim()) throw new Error("Subagent task must not be blank.");
 			const { policy, error: policyError } = loadModelPolicy();
 			if (policyError) throw new Error(policyError);
@@ -854,12 +878,16 @@ export default function (pi: ExtensionAPI) {
 
 			let resumePath: string | undefined;
 			let config: RunConfig;
+			// Resuming continues the same agent, so it keeps its original name by default; an explicit
+			// label argument still overrides it.
+			let label = params.label;
 			if (params.resume) {
 				if (params.model || params.thinking || params.tools || params.cwd) {
 					throw new Error("A resumed subagent accepts only task, resume, label, and timeoutMs. Start a fresh child to change runtime configuration.");
 				}
 				resumePath = resolveResumePath(params.resume);
 				const saved = readChildMetadata(resumePath);
+				label ??= saved.label;
 				if (policy.enabled && !saved.model) {
 					throw new Error("The resumed session does not record a verifiable model. Start a fresh child using the current model policy.");
 				}
@@ -892,11 +920,13 @@ export default function (pi: ExtensionAPI) {
 			const result = await runChild(
 				config,
 				params.task,
-				params.label,
+				label,
 				params.timeoutMs,
 				resumePath,
 				signal,
 				onUpdate,
+				{},
+				toolCallId,
 			);
 			return {
 				content: [{ type: "text", text: modelFacingResult(result) }],
@@ -906,7 +936,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderCall(args, theme) {
 			const preview = args.task.length > 72 ? `${args.task.slice(0, 72)}…` : args.task;
-			const identity = args.label ?? (args.resume ? "resume" : "child");
+			const identity = args.label ?? (args.resume ? "resume" : "create");
 			const timeout = timeoutBadge(typeof args.timeoutMs === "number" ? args.timeoutMs : undefined);
 			return new Text(
 				`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", identity)}${timeout ? ` ${theme.fg("dim", timeout)}` : ""}\n  ${theme.fg("dim", preview)}`,
@@ -928,7 +958,7 @@ export default function (pi: ExtensionAPI) {
 				: success
 					? theme.fg("success", "✓")
 					: theme.fg(status === "timeout" ? "warning" : "error", "✗");
-			const title = result.label ?? (result.resumed ? "resumed child" : "child");
+			const title = result.label ?? (result.resumed ? "resume" : "create");
 			const items = displayItems(result);
 
 			if (status === "running") {
@@ -973,4 +1003,9 @@ export default function (pi: ExtensionAPI) {
 			return container;
 		},
 	});
+}
+
+export default function (pi: ExtensionAPI) {
+	pi.registerTool(subagentModelsToolDefinition);
+	pi.registerTool(createSubagentToolDefinition(pi));
 }
