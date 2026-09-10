@@ -32,7 +32,8 @@
   },
   "pi": {
     "extensions": [
-      "extensions/subagent/index.ts"
+      "extensions/subagent/index.ts",
+      "extensions/subagent-viewer/index.ts"
     ]
   },
   "peerDependencies": {
