@@ -49,7 +49,16 @@ interface ToolActivity {
 
 // Keyed by toolCallId. A running call's own SubagentResult object, mutated in place as the run
 // progresses -- absent once the call finishes, since its toolResult then carries the same data.
-export const activeSubagentCalls = new Map<string, SubagentResult>();
+//
+// Pi's extension loader evaluates this file through a fresh jiti instance (moduleCache: false)
+// per top-level pi.extensions entry, so subagent-viewer's static import of this module gets its
+// own separate copy, not the one this tool's execute() actually mutates. Stashing the Map on
+// globalThis under a registry-wide symbol keeps every copy pointing at the same object, since
+// globalThis is shared across all jiti-loaded modules in this process.
+const ACTIVE_CALLS_KEY = Symbol.for("pi-subagent.activeSubagentCalls");
+const globalWithActiveCalls = globalThis as typeof globalThis & { [ACTIVE_CALLS_KEY]?: Map<string, SubagentResult> };
+export const activeSubagentCalls: Map<string, SubagentResult> =
+	globalWithActiveCalls[ACTIVE_CALLS_KEY] ?? (globalWithActiveCalls[ACTIVE_CALLS_KEY] = new Map());
 
 export interface SubagentResult {
 	task: string;
