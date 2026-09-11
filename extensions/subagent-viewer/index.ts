@@ -20,7 +20,7 @@ import {
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, matchesKey, type OverlayOptions, Spacer, truncateToWidth, type TUI, visibleWidth } from "@earendil-works/pi-tui";
-import { activeSubagentCalls, createSubagentToolDefinition, type SubagentDetails, subagentModelsToolDefinition } from "../subagent/index.ts";
+import { activeSubagentCalls, createSubagentToolDefinition, formatTokensCompact, type SubagentDetails, subagentModelsToolDefinition } from "../subagent/index.ts";
 
 // Chrome lines around the scrollable transcript viewport: top rule, header, separator, ...,
 // separator, footer, bottom rule.
@@ -211,6 +211,11 @@ interface SubagentSessionInfo extends SessionInfo {
 	// One per instruction the parent gave the child: the initial task, plus one per resume.
 	userTurns: number;
 	toolCalls: number;
+	// Fresh child's model, carried from its original invocation: a resume cannot change it.
+	model?: string;
+	// Context occupied as of the most recent turn, and the model's total context window.
+	contextUsed?: number;
+	contextWindow?: number;
 }
 
 async function buildSessionInfo(filePath: string): Promise<SubagentSessionInfo | undefined> {
@@ -256,6 +261,9 @@ interface SubagentCall {
 	sessionFile: string;
 	ownLabel?: string;
 	resumed: boolean;
+	model?: string;
+	contextUsed?: number;
+	contextWindow?: number;
 	// Still executing: this call has no toolResult yet, only a live entry in activeSubagentCalls.
 	running: boolean;
 }
@@ -322,6 +330,9 @@ async function currentConversationSubagentTurns(ctx: ExtensionCommandContext): P
 			sessionFile: result.sessionFile,
 			ownLabel: result.label,
 			resumed: result.resumed,
+			model: result.model,
+			contextUsed: result.contextUsed,
+			contextWindow: result.contextWindow,
 			running: false,
 		});
 	}
@@ -340,6 +351,9 @@ async function currentConversationSubagentTurns(ctx: ExtensionCommandContext): P
 			sessionFile: live.sessionFile,
 			ownLabel: live.label,
 			resumed: live.resumed,
+			model: live.model,
+			contextUsed: live.contextUsed,
+			contextWindow: live.contextWindow,
 			running: true,
 		});
 	}
@@ -371,6 +385,10 @@ async function currentConversationSubagentTurns(ctx: ExtensionCommandContext): P
 
 		const originalCall = originalCallForFile.get(call.sessionFile)!;
 		const latestCall = latestCallForFile.get(call.sessionFile)!;
+		if (session.model === undefined) session.model = originalCall.model ?? latestCall.model;
+		// Context usage reflects the session's current state, so always take the latest call's figures.
+		session.contextUsed = latestCall.contextUsed ?? session.contextUsed;
+		session.contextWindow = latestCall.contextWindow ?? session.contextWindow;
 		const superseded = latestCall !== call;
 		const own = resolvedLabel(call, originalCall, session);
 		const displayLabel = superseded ? `${own} (${resolvedLabel(latestCall, originalCall, session)})` : own;
@@ -488,7 +506,7 @@ class SubagentTranscript {
 }
 
 class SubagentViewerComponent implements Component {
-	private readonly session: SessionInfo;
+	private readonly session: SubagentSessionInfo;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
 	private readonly done: () => void;
@@ -503,7 +521,7 @@ class SubagentViewerComponent implements Component {
 	private lastStatSignature: string | undefined;
 	private readonly pollTimer: ReturnType<typeof setInterval>;
 
-	constructor(session: SessionInfo, tui: TUI, theme: Theme, toolDefinitions: Record<string, ToolDefinition<any, any>>, done: () => void) {
+	constructor(session: SubagentSessionInfo, tui: TUI, theme: Theme, toolDefinitions: Record<string, ToolDefinition<any, any>>, done: () => void) {
 		this.session = session;
 		this.tui = tui;
 		this.theme = theme;
@@ -644,7 +662,13 @@ class SubagentViewerComponent implements Component {
 		const position = maxScrollTop > 0
 			? this.theme.fg("muted", ` (${this.scrollTop + 1}-${Math.min(this.scrollTop + viewportHeight, contentLines.length)}/${contentLines.length})`)
 			: "";
-		const header = `${this.theme.fg("toolTitle", this.theme.bold("Subagent transcript"))} ${this.theme.fg("dim", this.session.cwd || this.session.path)}${position}`;
+		const left = `${this.theme.fg("toolTitle", this.theme.bold("Subagent transcript"))} ${this.theme.fg("dim", this.session.cwd || this.session.path)}${position}`;
+		const contextText = this.session.contextUsed !== undefined && this.session.contextWindow
+			? `${((this.session.contextUsed / this.session.contextWindow) * 100).toFixed(1)}%/${formatTokensCompact(this.session.contextWindow)} `
+			: "";
+		const right = this.session.model ? this.theme.fg("dim", `${contextText}${this.session.model}`) : "";
+		const gap = Math.max(1, boxInnerWidth(width) - visibleWidth(left) - visibleWidth(right));
+		const header = right ? `${left}${" ".repeat(gap)}${right}` : left;
 		const footer = [
 			["↑/↓ j/k", "scroll"],
 			["ctrl+u/d", "half page"],
@@ -802,7 +826,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const selected = await ctx.ui.custom<SessionInfo | undefined>(
+			const selected = await ctx.ui.custom<SubagentSessionInfo | undefined>(
 				(tui, theme, _keybindings, done) => new SubagentPickerComponent(turns, tui, theme, done),
 				{ overlay: true, overlayOptions: OVERLAY_OPTIONS },
 			);
