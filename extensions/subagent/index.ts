@@ -82,7 +82,6 @@ export interface SubagentResult {
 	stopReason?: string;
 	errorMessage?: string;
 	sessionFile?: string;
-	sessionId?: string;
 }
 
 export interface SubagentDetails {
@@ -534,7 +533,7 @@ async function runChild(
 	const sessionDir = path.join(dependencies.agentDir ?? getAgentDir(), "sessions", "subagent", runId);
 	if (!resumePath) await fs.promises.mkdir(sessionDir, { recursive: true });
 
-	const args = ["--mode", "json", "-p"];
+	const args = ["--mode", "rpc"];
 	if (resumePath) args.push("--session", resumePath);
 	else args.push("--session-dir", sessionDir);
 	if (config.model) args.push("--model", config.model);
@@ -612,10 +611,17 @@ async function runChild(
 					return;
 				}
 
-				if (event.type === "session" && event.id) {
-					result.sessionId = event.id;
-					if (!resumePath) resolveSessionFile(sessionDir, result);
-					emitUpdate();
+				// RPC mode never emits a "session" event (that's a print-mode-only header line), so
+				// poll the session directory instead: cheap once sessionFile is found, since every
+				// later call short-circuits on it.
+				if (!resumePath && !result.sessionFile) resolveSessionFile(sessionDir, result);
+
+				if (event.type === "response" && event.command === "prompt") {
+					if (event.success === false) result.errorMessage = event.error;
+					return;
+				}
+				if (event.type === "agent_settled") {
+					proc.stdin?.end();
 					return;
 				}
 				if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -674,7 +680,7 @@ async function runChild(
 			};
 
 			proc.stdin?.on("error", () => {});
-			proc.stdin?.end(task);
+			proc.stdin?.write(`${JSON.stringify({ type: "prompt", id: "prompt", message: task })}\n`);
 			proc.stdout?.on("data", (data) => {
 				buffer += decoder.write(data);
 				const lines = buffer.split("\n");
