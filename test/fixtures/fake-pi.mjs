@@ -47,6 +47,10 @@ const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", async (line) => {
   if (!line.trim()) return;
   const command = JSON.parse(line);
+  if (command.type === "get_state") {
+    emit({ id: command.id, type: "response", command: "get_state", success: true, data: { sessionFile } });
+    return;
+  }
   if (command.type !== "prompt") return;
   const task = command.message;
   emit({ id: command.id, type: "response", command: "prompt", success: true });

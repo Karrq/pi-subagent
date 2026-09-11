@@ -611,11 +611,13 @@ async function runChild(
 					return;
 				}
 
-				// RPC mode never emits a "session" event (that's a print-mode-only header line), so
-				// poll the session directory instead: cheap once sessionFile is found, since every
-				// later call short-circuits on it.
-				if (!resumePath && !result.sessionFile) resolveSessionFile(sessionDir, result);
-
+				if (event.type === "response" && event.command === "get_state") {
+					// The session is created during the child's startup, before it reads any commands, so
+					// asking here always gets a real answer -- no need to guess by polling the directory.
+					if (event.success && event.data?.sessionFile) result.sessionFile = event.data.sessionFile;
+					emitUpdate();
+					return;
+				}
 				if (event.type === "response" && event.command === "prompt") {
 					if (event.success === false) result.errorMessage = event.error;
 					return;
@@ -680,6 +682,7 @@ async function runChild(
 			};
 
 			proc.stdin?.on("error", () => {});
+			if (!resumePath) proc.stdin?.write(`${JSON.stringify({ type: "get_state", id: "state" })}\n`);
 			proc.stdin?.write(`${JSON.stringify({ type: "prompt", id: "prompt", message: task })}\n`);
 			proc.stdout?.on("data", (data) => {
 				buffer += decoder.write(data);
