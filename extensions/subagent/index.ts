@@ -73,6 +73,10 @@ export interface SubagentResult {
 	partialText: string;
 	stderr: string;
 	usage: UsageStats;
+	// Tokens occupied by the context as of the most recent turn (totalTokens of that turn's
+	// usage, not the run's cumulative total): what a resume would actually resend.
+	contextUsed?: number;
+	contextWindow?: number;
 	model?: string;
 	thinking?: string;
 	stopReason?: string;
@@ -460,10 +464,26 @@ function truncateResult(output: string, sessionFile?: string): string {
 	return `${truncated.content}\n\n[Output truncated: ${truncated.outputLines} of ${truncated.totalLines} lines, ${truncated.outputBytes} of ${truncated.totalBytes} bytes.]${sessionHint}`;
 }
 
+// Mirrors pi's own footer formatting (formatTokens in modes/interactive/components/footer.ts)
+// so the reported context figures read the same as the main status bar.
+export function formatTokensCompact(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
 function envelope(result: SubagentResult): string {
 	const fields: string[] = [];
 	if (result.label) fields.push(`label=${result.label}`);
 	fields.push(`status=${statusOf(result)}`);
+	if (result.contextUsed !== undefined) {
+		const context = result.contextWindow
+			? `${((result.contextUsed / result.contextWindow) * 100).toFixed(1)}%/${formatTokensCompact(result.contextWindow)}`
+			: formatTokensCompact(result.contextUsed);
+		fields.push(`context=${context}`);
+	}
 	if (result.sessionFile) fields.push(`session=${result.sessionFile}`);
 	return `[${fields.join(" ")}]`;
 }
@@ -635,7 +655,10 @@ async function runChild(
 					if (message.role === "assistant") {
 						result.partialText = "";
 						currentTurnUsage = undefined;
-						if (message.usage) addUsage(result.usage, message.usage);
+						if (message.usage) {
+							addUsage(result.usage, message.usage);
+							result.contextUsed = message.usage.totalTokens;
+						}
 						const reportedModel = message.model as string | undefined;
 						const provider = (message as any).provider as string | undefined;
 						if (reportedModel && !config.model) {
@@ -685,7 +708,10 @@ async function runChild(
 		});
 
 		result.exitCode = exitCode;
-		if (currentTurnUsage) addUsage(result.usage, currentTurnUsage);
+		if (currentTurnUsage) {
+			addUsage(result.usage, currentTurnUsage);
+			result.contextUsed = currentTurnUsage.totalTokens;
+		}
 		if (!resumePath) resolveSessionFile(sessionDir, result);
 		if (!resumePath && !result.sessionFile) {
 			result.errorMessage = "Child session was not created; this run cannot be resumed.";
@@ -937,6 +963,7 @@ export function createSubagentToolDefinition(pi: ExtensionAPI) {
 				{},
 				toolCallId,
 			);
+			if (result.model) result.contextWindow = modelMap(ctx.modelRegistry).get(result.model)?.contextWindow;
 			return {
 				content: [{ type: "text", text: modelFacingResult(result) }],
 				details: { result },
